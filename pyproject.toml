@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "common-auth"
+version = "0.1.0"
+description = "Shared Firebase authentication and Gemini usage tracking for Cloud Run apps."
+requires-python = ">=3.10"
+dependencies = [
+    "firebase-admin>=6.0",
+    "google-cloud-firestore>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "flask>=3.0",
+    "fastapi>=0.100",
+    "httpx>=0.24",
+]
+
+[tool.setuptools.packages.find]
+include = ["common_auth*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
