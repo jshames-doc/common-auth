@@ -480,22 +480,26 @@ GET  /admin/usage/summary      → aggregated: {app, requests, total_tokens, est
 ### Per-app checklist (apply to each)
 1. Add `common-auth` (pinned git tag) to the app's `requirements.txt`.
 2. Set `APP_ID=<value from the table above>` in `cloudbuild.yaml` / `deploy.bat`.
-3. Add `FIREBASE_CREDENTIALS_JSON` (Secret Manager) to the deploy config.
+3. Add `FIREBASE_CREDENTIALS_JSON` (Secret Manager) + `FIREBASE_API_KEY` / `FIREBASE_AUTH_DOMAIN` / `FIREBASE_PROJECT_ID` (plain env vars) to the deploy config.
 4. **Backend:**
-   - FastAPI apps: protect every Gemini-calling route with `Depends(require_user(APP_ID))`.
-   - Flask apps: protect every Gemini-calling route with `@login_required(APP_ID)`.
-   - Add a public `/auth/config` endpoint returning Firebase web config (same as pilot).
+   - FastAPI apps: create a `get_current_user` wrapper dependency (see "Backend Integration" lessons above), protect every Gemini-calling route with `Depends(get_current_user)`, and catch `UsageLimitExceededError` → 429 in each route handler.
+   - Flask apps: protect every Gemini-calling route with `@login_required(APP_ID)`. Catch `UsageLimitExceededError` and return a 429 JSON response.
+   - Add a public `/auth/config` endpoint returning Firebase web config (with an `AuthConfigResponse` model for FastAPI apps).
 5. **Frontend:** add the Firebase client SDK + email/password login (copy the pilot's `api.js` token handling and login UI). Remove any existing PIN/access UI. Include:
    - A visible "Sign Out" button (with text label) in the top bar when logged in.
    - A "Forgot your password? Contact the admin" `mailto:` link on the login screen.
    - A password visibility toggle (eye icon) on the password field.
-6. **Gemini usage:** apply the Phase 5 wrap at each Gemini call site listed in the Phase 5 table.
-7. **Tests:** update each app's test suite to mock `verify_firebase_token` and pass a fake `Authorization` header; remove any PIN-related tests. Run the suite; all must pass.
+   - Bump the PWA service worker cache version when adding Firebase SDK scripts to `index.html`.
+6. **Gemini usage:** apply the Phase 5 wrap at each Gemini call site listed in the Phase 5 table. Pass `uid` and `app_id` through to the Gemini functions. Use a `_log_usage_safe()` wrapper so Firestore errors don't break user requests.
+7. **Tests:**
+   - Create a `conftest.py` with `mock_usage_tracking` (autouse) and `client` (dependency override) fixtures — see "Test Infrastructure" lessons above.
+   - Update direct Gemini function calls in unit tests to pass `uid`/`app_id` args.
+   - Remove any PIN-related tests. Run the suite; all must pass.
 8. **Deploy:** push to `main` (Cloud Build) or run `deploy.bat`. Verify on the live service.
 
 ### App-specific notes
-- **Clinical Dictation** — no PIN to remove; just add auth. Keep the 32 KB `/api/format` and 20 MB `/api/transcribe` limits. Protect both `/api/format` and `/api/transcribe`.
-- **AI Neuro Exam** — Flask + `unittest` (not pytest). Tests use Flask test client; adapt the auth mock accordingly. Gemini has a fallback when no key — only log usage on real (non-fallback) calls.
+- **Clinical Dictation** — ✅ DONE (Phase 7). No PIN to remove; just added auth. Protected both `/api/format` and `/api/transcribe`. Kept the 32 KB and 20 MB limits. 63 tests pass.
+- **AI Neuro Exam** — Flask + `unittest` (not pytest). Tests use Flask test client; adapt the auth mock accordingly (Flask's `login_required` decorator can be monkeypatched at module level instead of FastAPI dependency overrides). Gemini has a fallback when no key — only log usage on real (non-fallback) calls.
 - **Rehab Consultant** — Flask (`server_hebrew.py`), Cypress e2e tests on port 5001. The Cypress smoke spec will need a Firebase login step (seed a test user, sign in via the UI in a `beforeEach`). Keep the bilingual/RTL layout intact.
 - **Orthotics Assistant** — FastAPI with a deterministic engine + optional AI layer. Protect the recommendation/report endpoints; only log Gemini usage when the AI orchestrator actually calls Gemini (not when it returns `ai_unavailable`).
 
@@ -608,3 +612,59 @@ These apply to every app converted in Phase 7. Check each item before pushing.
 - **`gcloud run deploy --source .` vs two-step build+deploy.** The single-step `--source .` approach combines `gcloud builds submit` and `gcloud run deploy --image` into one command. When a `Dockerfile` exists, it uses Docker build (not buildpacks). Buildpacks are only used when there is no Dockerfile. The single-step approach is cleaner but not inherently faster — build time is dominated by pip install.
 - **Docker layer caching in Cloud Build.** Cloud Build does not cache Docker layers by default. Each deploy rebuilds from scratch (re-installs all pip packages). The Dockerfile should copy `requirements.txt` and install deps before copying code, so unchanged requirements benefit from any available cache. For explicit caching, use the two-step approach with `gcloud builds submit --cache-from`.
 - **Browser cache and static files.** When updating frontend HTML/JS/CSS, users may see stale versions due to browser cache. Use hard refresh (Ctrl+Shift+R) or version query params (`?v=1.0`) on script/style tags to bust cache. The DevTools MCP browser can be used to verify changes are live.
+
+### Backend Integration (from Phase 7 — Clinical Dictation)
+
+- **`require_user(app_id)` returns a closure — not overridable in tests.** You cannot do `app.dependency_overrides[require_user(APP_ID)] = ...` because each call to `require_user(app_id)` creates a new closure. Instead, create a module-level wrapper function in `app.py`:
+  ```python
+  _require_user = require_user(os.environ.get("APP_ID", "clinical_dictation"))
+
+  def get_current_user() -> UserContext:
+      return _require_user()
+  ```
+  Then use `Depends(get_current_user)` in routes. Tests override `get_current_user`:
+  ```python
+  app.dependency_overrides[app_module.get_current_user] = lambda: UserContext(
+      uid="test-uid", email="test@example.com", app_id="clinical_dictation"
+  )
+  ```
+  This is the single most important pattern for testable auth integration.
+
+- **`UsageLimitExceededError` does not auto-map to 429.** The route handler must catch it explicitly with a try/except around the Gemini call and return a `JSONResponse(status_code=429, ...)`. Without this, the error surfaces as a 500.
+  ```python
+  try:
+      result = await gemini.format_note(req, uid=user.uid, app_id=APP_ID)
+  except UsageLimitExceededError:
+      return JSONResponse(status_code=429, content={"detail": "Daily usage limit reached."})
+  ```
+
+- **Usage logging must be failure-safe.** Wrap `log_gemini_usage` in a try/except inside the Gemini module (e.g. `_log_usage_safe()`) so Firestore errors don't break the user's request. The user should still get their formatted note even if usage logging fails.
+
+- **Gemini function signatures change — unit tests must follow.** Adding `uid` and `app_id` params to `format_note()` and `transcribe_audio()` breaks every direct call in `test_gemini.py`. Each test must be updated to pass `uid="test-uid", app_id="<app_id>"`. The conftest's `mock_usage_tracking` autouse fixture patches `check_usage_limit` and `log_gemini_usage` so these calls don't hit Firestore.
+
+- **`AuthConfigResponse` Pydantic model.** The `/auth/config` endpoint needs a response model with `apiKey`, `authDomain`, `projectId` fields. Without it, FastAPI's response validation fails or the OpenAPI schema is wrong.
+
+- **Firebase web config env vars in deploy config.** In addition to `APP_ID` and `FIREBASE_CREDENTIALS_JSON` (secret), the deploy config (`cloudbuild.yaml` / `deploy.bat`) must set `FIREBASE_API_KEY`, `FIREBASE_AUTH_DOMAIN`, `FIREBASE_PROJECT_ID` as plain env vars in `--update-env-vars`. The `/auth/config` endpoint reads these and returns them to the frontend. They are not secrets (the Web API key is designed for client-side embedding).
+
+- **`.env.example` must include all Firebase vars.** For local dev onboarding, `.env.example` should list `APP_ID`, `FIREBASE_API_KEY`, `FIREBASE_AUTH_DOMAIN`, `FIREBASE_PROJECT_ID`, and `FIREBASE_CREDENTIALS_PATH` (local file path, not the Secret Manager JSON).
+
+### Test Infrastructure (from Phase 7 — Clinical Dictation)
+
+- **`conftest.py` pattern for FastAPI apps.** Two fixtures are needed:
+  1. `mock_usage_tracking` (autouse) — patches `check_usage_limit` (returns `True`) and `log_gemini_usage` (no-op) so tests never hit Firestore.
+  2. `client` — sets env vars (`APP_ID`, `FIREBASE_API_KEY`, etc.), overrides the `get_current_user` dependency with a fake `UserContext`, yields a `TestClient`, and clears overrides at teardown.
+  Remove any existing `client` fixture from `test_app.py` so the conftest one is used.
+
+- **Testing 401 (unauthenticated).** To test that a route returns 401 without a token, clear `dependency_overrides` inside the test and mock `firebase_init.init_firebase` (so `require_user` doesn't try to initialize Firebase). Restore the override in a `finally` block for subsequent tests.
+
+- **`_patch_transcribe` fakes must accept `uid`/`app_id` kwargs.** When patching `transcribe_audio` at the module level in tests, the fake function signature must include `uid=""` and `app_id=""` keyword args, otherwise the route handler's call fails with a `TypeError`.
+
+### Frontend / PWA (from Phase 7 — Clinical Dictation)
+
+- **Firebase SDK from CDN doesn't need service worker caching.** The SW only intercepts same-origin GET requests. Cross-origin CDN scripts (e.g. `https://www.gstatic.com/firebasejs/...`) fall through to the network. No need to add them to `SHELL_URLS` or `SHELL_ASSETS`.
+
+- **Bump `SHELL_CACHE` when adding Firebase SDK scripts.** Even though the CDN scripts aren't cached, adding the `<script>` tags to `index.html` changes the shell HTML, so bump the cache version in `sw.js` to force clients to pick up the new shell.
+
+- **`api.js` token handling pattern.** Use a module-scoped `_idToken` variable with `setIdToken()`/`getIdToken()` setters. The `authHeaders()` helper merges the Bearer header into any existing headers (important for `FormData` requests where you must NOT set `Content-Type`). On 401, call `firebase.auth().currentUser.getIdToken(true)` to force-refresh, then retry the request once. If the refresh fails (no current user), throw a "Sign in required" error.
+
+- **`app.js` auth initialization.** Call `wireAuth()` from `init()` (after other setup, before `setView`). `wireAuth()` wires the password toggle, sign-in form submit, sign-out button, and calls `initializeAccess()` which fetches `/auth/config`, initializes Firebase, and registers an `onAuthStateChanged` listener that shows/hides the modal and sets/clears the ID token.
