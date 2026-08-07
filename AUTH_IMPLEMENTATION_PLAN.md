@@ -439,8 +439,9 @@ log_gemini_usage(
 ### Backend endpoints
 ```
 GET  /admin/users              → list users (uid, email, display_name, active, role)
-POST /admin/users              → create user (calls firebase_admin.auth.create_user + writes users/{uid})
-PATCH /admin/users/{uid}       → update active / role / daily_token_limit
+POST /admin/users              → create user (auto-generates temp password, returns reset_link)
+PATCH /admin/users/{uid}       → update active / role / daily_token_limit / display_name
+DELETE /admin/users/{uid}      → delete user (Firebase Auth + Firestore + app_access cleanup; blocks self-deletion)
 POST /admin/users/{uid}/reset  → reset password (firebase_admin.auth.generate_password_reset_link)
 GET  /admin/access             → list app_access docs
 POST /admin/access             → {uid, app, allowed} upsert
@@ -450,7 +451,10 @@ GET  /admin/usage/summary      → aggregated: {app, requests, total_tokens, est
 ```
 
 ### Frontend views
-- **Users table:** User | Status (Active/Disabled) | Role | Apps | Daily limit | Actions (disable, reset, edit).
+- **Users table:** User | Status (Active/Disabled) | Role | Daily limit | Actions (Edit, Reset, Delete).
+- **Add User modal:** email, display name, role, daily token limit (no password field). After creation, shows a complete email text with the password reset link and a "Copy Email Text" button so the admin can paste it into an email to the user.
+- **Reset Password modal:** shows a complete email text (greeting, instructions, reset link, signature) with a "Copy Email Text" button — no more console.log.
+- **Delete User:** red Delete button on each row with a confirmation dialog. Cleans up Firebase Auth, Firestore user doc, and all app_access records. Prevents self-deletion.
 - **App access matrix:** rows = users, columns = apps, cells = allowed toggle. (Convenience view over `app_access`.)
 - **Usage dashboard:** table `Application | Requests | Tokens | Est. Cost` with date-range filter. Match the source plan's example:
   ```
@@ -460,8 +464,10 @@ GET  /admin/usage/summary      → aggregated: {app, requests, total_tokens, est
   ```
 
 ### Deploy
-- `cloudbuild.yaml` deploys to `auth-admin` in `me-west1`, `--allow-unauthenticated=false` (only Firebase-authenticated admins can use it; the app itself enforces admin role).
+- `deploy.bat` uses `gcloud run deploy --source .` (single-step build + deploy with Dockerfile).
+- `--allow-unauthenticated` is set so the infrastructure is public; the app itself enforces Firebase auth + admin role at the application level.
 - Set `APP_ID=auth_admin` and `FIREBASE_CREDENTIALS_JSON` from Secret Manager.
+- `run.bat` provided for local dev (kills port 8000, starts uvicorn, opens browser).
 
 **Deliverable:** Jeff can log into `auth-admin.<domain>` and manage users, app access, and view Gemini spend.
 
@@ -585,3 +591,17 @@ These apply to every app converted in Phase 7. Check each item before pushing.
 ### Local Development
 - **`FIREBASE_CREDENTIALS_PATH` for local dev.** In production, `FIREBASE_CREDENTIALS_JSON` (the full JSON string) is injected from Secret Manager. For local dev, pull the service account JSON to a local file (gitignored) and set `FIREBASE_CREDENTIALS_PATH` to its path in `backend/.env`.
 - **Check for stale processes on port 8000.** Before starting the backend, run `netstat -ano | findstr ":8000"` and kill any stale uvicorn processes from other apps.
+
+### User Management & Password Reset (from Phase 6 admin app)
+- **Auto-generate temp password on user creation.** The admin never types a password. The backend generates a random 16-char password, creates the Firebase Auth user, then immediately calls `generate_password_reset_link` and returns it in the response. The frontend shows a complete email text with the link for the admin to copy and send to the user.
+- **`min_length` on optional Pydantic fields rejects `None`.** If a field is `str | None = Field(default=None, min_length=6)`, Pydantic will reject `None` with a 422 error. Remove `min_length` from optional fields, or use a validator that only applies the constraint when a value is provided.
+- **Firebase Admin SDK `generate_password_reset_link` does not send an email.** It only returns a URL. The admin must copy the link (or a complete email text containing it) and send it to the user manually. To actually email the user, you would need the Firebase Client SDK's `sendPasswordResetEmail` (client-side only).
+- **Delete user cleanup.** When deleting a user, clean up all three layers: Firebase Auth user, Firestore `users/{uid}` doc, and all `app_access` docs where `uid` matches. Prevent self-deletion (admin cannot delete their own account).
+- **Forgot password link on login screens.** All apps' login screens should include a "Forgot your password or need access? Contact the admin" link with a `mailto:` to the admin email. This gives users a clear path when they can't log in.
+- **Password visibility toggle.** All password fields should include an eye icon to toggle between hidden/visible. Implementation: wrap the input in a `.password-field` div with a `.password-toggle` button that switches `input.type` between `password` and `text` and swaps the Lucide icon between `eye` and `eye-off`.
+- **Sign Out button on all apps.** Every app should have a visible "Sign Out" button (with text label, not just an icon) in the top bar when the user is logged in. This allows users to test the login flow and is essential for shared/kiosk devices.
+
+### Deployment (from Phase 6 admin app)
+- **`gcloud run deploy --source .` vs two-step build+deploy.** The single-step `--source .` approach combines `gcloud builds submit` and `gcloud run deploy --image` into one command. When a `Dockerfile` exists, it uses Docker build (not buildpacks). Buildpacks are only used when there is no Dockerfile. The single-step approach is cleaner but not inherently faster — build time is dominated by pip install.
+- **Docker layer caching in Cloud Build.** Cloud Build does not cache Docker layers by default. Each deploy rebuilds from scratch (re-installs all pip packages). The Dockerfile should copy `requirements.txt` and install deps before copying code, so unchanged requirements benefit from any available cache. For explicit caching, use the two-step approach with `gcloud builds submit --cache-from`.
+- **Browser cache and static files.** When updating frontend HTML/JS/CSS, users may see stale versions due to browser cache. Use hard refresh (Ctrl+Shift+R) or version query params (`?v=1.0`) on script/style tags to bust cache. The DevTools MCP browser can be used to verify changes are live.
