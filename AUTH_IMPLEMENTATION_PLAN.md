@@ -499,7 +499,7 @@ GET  /admin/usage/summary      → aggregated: {app, requests, total_tokens, est
 
 ### App-specific notes
 - **Clinical Dictation** — ✅ DONE (Phase 7). No PIN to remove; just added auth. Protected both `/api/format` and `/api/transcribe`. Kept the 32 KB and 20 MB limits. 63 tests pass.
-- **AI Neuro Exam** — Flask + `unittest` (not pytest). Tests use Flask test client; adapt the auth mock accordingly (Flask's `login_required` decorator can be monkeypatched at module level instead of FastAPI dependency overrides). Gemini has a fallback when no key — only log usage on real (non-fallback) calls.
+- **AI Neuro Exam** — ✅ DONE (Phase 7). Flask + `unittest` (not pytest). Tests use Flask test client; auth mocked by patching `verify_firebase_token`/`is_active`/`can_access_app`/`firebase_init.init_firebase` at the `common_auth.adapters.flask_auth` module level in a shared `AuthenticatedTestCase` base class. Gemini has a fallback when no key — `check_usage_limit` and `log_gemini_usage` are only called on the real Gemini path (not the fallback). 53 tests pass.
 - **Rehab Consultant** — Flask (`server_hebrew.py`), Cypress e2e tests on port 5001. The Cypress smoke spec will need a Firebase login step (seed a test user, sign in via the UI in a `beforeEach`). Keep the bilingual/RTL layout intact.
 - **Orthotics Assistant** — FastAPI with a deterministic engine + optional AI layer. Protect the recommendation/report endpoints; only log Gemini usage when the AI orchestrator actually calls Gemini (not when it returns `ai_unavailable`).
 
@@ -668,3 +668,29 @@ These apply to every app converted in Phase 7. Check each item before pushing.
 - **`api.js` token handling pattern.** Use a module-scoped `_idToken` variable with `setIdToken()`/`getIdToken()` setters. The `authHeaders()` helper merges the Bearer header into any existing headers (important for `FormData` requests where you must NOT set `Content-Type`). On 401, call `firebase.auth().currentUser.getIdToken(true)` to force-refresh, then retry the request once. If the refresh fails (no current user), throw a "Sign in required" error.
 
 - **`app.js` auth initialization.** Call `wireAuth()` from `init()` (after other setup, before `setView`). `wireAuth()` wires the password toggle, sign-in form submit, sign-out button, and calls `initializeAccess()` which fetches `/auth/config`, initializes Firebase, and registers an `onAuthStateChanged` listener that shows/hides the modal and sets/clears the ID token.
+
+### Flask / unittest Integration (from Phase 7 — AI Neuro Exam)
+
+- **`@login_required(APP_ID)` is applied at import time — you cannot override it in tests.** Unlike FastAPI's `Depends(get_current_user)` which can be overridden via `app.dependency_overrides`, the Flask decorator wraps the view function when the module is imported. By the time the test client is created, the wrapper is already in place. Instead, patch the underlying functions the decorator calls at the `common_auth.adapters.flask_auth` module level: `verify_firebase_token`, `is_active`, `can_access_app`, and `firebase_init.init_firebase`. The test client must send an `Authorization: Bearer fake-token` header so `_extract_bearer_token()` returns a non-None value.
+  ```python
+  from common_auth.adapters import flask_auth
+  patches = [
+      patch.object(flask_auth, "verify_firebase_token", return_value={"uid": "test-uid", "email": "test@example.com"}),
+      patch.object(flask_auth, "is_active", return_value=True),
+      patch.object(flask_auth, "can_access_app", return_value=True),
+      patch("common_auth.adapters.flask_auth.firebase_init.init_firebase"),
+  ]
+  ```
+  Use `patch.object(flask_auth, ...)` for the imported names (they're bound in the flask_auth namespace), and `patch("common_auth.adapters.flask_auth.firebase_init.init_firebase")` for the module attribute access.
+
+- **`unittest` has no autouse fixtures — use a base TestCase.** Since Flask apps may use `unittest` (not pytest), there's no `conftest.py` with autouse fixtures. Create a shared `tests/auth_test_base.py` with an `AuthenticatedTestCase(unittest.TestCase)` base class that starts all patches in `setUp()` and stops them in `addCleanup()`. Test classes inherit from it instead of `unittest.TestCase` directly. A separate `UnauthenticatedTestCase` base (only mocks `firebase_init.init_firebase`) is useful for testing the 401 path.
+
+- **`UsageLimitExceededError` → 429 in Flask.** The Flask route handler catches it explicitly with a try/except around the Gemini call and returns `jsonify({...}), 429`. Same pattern as FastAPI but using Flask's `jsonify` + tuple return instead of `JSONResponse`.
+
+- **Gemini fallback apps: guard `check_usage_limit` and `log_gemini_usage` with an `if uid and app_id:` check.** When the app has a fallback path (no API key → return hardcoded response), the fallback must NOT call `check_usage_limit` or `log_gemini_usage`. Only the real Gemini code path (after the `if not self.api_key` guard) should call them. Pass `uid=""` and `app_id=""` as defaults so the guard is clean.
+
+- **`request.user` is the Flask equivalent of FastAPI's `UserContext`.** After `@login_required(APP_ID)` succeeds, `flask.request.user` is a `UserContext` with `.uid`, `.email`, and `.app_id`. Access it in the route handler via `request.user.uid`.
+
+- **No service worker? No SW cache bump needed.** The Neuro Exam app has no `sw.js` (not a PWA). The "bump `SHELL_CACHE`" lesson doesn't apply. Just bump the app version string in `index.html` and `README.md` (and the corresponding test assertions in `test_frontend_assets.py`).
+
+- **`cloudbuild.yaml` test step for unittest.** Use `python -m unittest discover -s tests -p "test_*.py" -v` instead of `python -m pytest`. The `python:3.12-slim` test image still needs `apt-get install git` for the `common-auth` pip git URL.
