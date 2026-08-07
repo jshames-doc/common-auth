@@ -480,7 +480,7 @@ GET  /admin/usage/summary      → aggregated: {app, requests, total_tokens, est
 ### Per-app checklist (apply to each)
 1. Add `common-auth` (pinned git tag) to the app's `requirements.txt`.
 2. Set `APP_ID=<value from the table above>` in `cloudbuild.yaml` / `deploy.bat`.
-3. Add `FIREBASE_CREDENTIALS_JSON` (Secret Manager) + `FIREBASE_API_KEY` / `FIREBASE_AUTH_DOMAIN` / `FIREBASE_PROJECT_ID` (plain env vars) to the deploy config.
+3. Add `FIREBASE_CREDENTIALS_JSON` and `FIREBASE_API_KEY` (both from Secret Manager) + `FIREBASE_AUTH_DOMAIN` / `FIREBASE_PROJECT_ID` (plain env vars) to the deploy config.
 4. **Backend:**
    - FastAPI apps: create a `get_current_user` wrapper dependency (see "Backend Integration" lessons above), protect every Gemini-calling route with `Depends(get_current_user)`, and catch `UsageLimitExceededError` → 429 in each route handler.
    - Flask apps: protect every Gemini-calling route with `@login_required(APP_ID)`. Catch `UsageLimitExceededError` and return a 429 JSON response.
@@ -587,13 +587,13 @@ These apply to every app converted in Phase 7. Check each item before pushing.
 
 ### Secret Manager / IAM
 - **Cloud Run runtime SA needs `roles/secretmanager.secretAccessor`.** The runtime service account (`<project-number>-compute@developer.gserviceaccount.com`) must be granted Secret Manager Secret Accessor at the project level (or per-secret) to read `firebase-service-account` and `gemini-api-key`. This was granted once during Phase 4 and applies to all services in the project.
-- **Two secrets are required for every app:** `firebase-service-account` (mapped to `FIREBASE_CREDENTIALS_JSON`) and `gemini-api-key` (mapped to `GEMINI_API_KEY`). Both already exist in Secret Manager.
+- **Three secrets are required for every app:** `firebase-service-account` (mapped to `FIREBASE_CREDENTIALS_JSON`), `gemini-api-key` (mapped to `GEMINI_API_KEY`), and `firebase-api-key` (mapped to `FIREBASE_API_KEY`). All three already exist in Secret Manager.
 
 ### Frontend (Firebase client SDK)
 - **Firebase ID tokens expire after 1 hour.** The frontend must refresh the token on 401 via `firebase.auth().currentUser.getIdToken(true)` and retry the request once. Without this, users get auth failures after ~1 hour of use.
 - **Clear the stored token on sign-out.** `onAuthStateChanged(null)` must call `Api.setIdToken(null)` and re-show the login modal, otherwise stale tokens get sent.
 - **Validate `/auth/config` response before initializing Firebase.** Check that `apiKey`, `authDomain`, and `projectId` are non-empty before calling `firebase.initializeApp()`.
-- **Firebase Web API key is not a secret.** It's designed to be embedded in client-side JavaScript. It's safe in `.env.example`, `cloudbuild.yaml`, and the `/auth/config` endpoint response.
+- **Firebase Web API key must be stored in Secret Manager.** Although the key is designed to be exposed to clients at runtime (via the `/auth/config` endpoint), it must NOT be committed to source files (`cloudbuild.yaml`, `deploy.bat`, `.env.example`, etc.). Secret scanners flag hardcoded keys as leaked credentials. Store it as a Secret Manager secret (`firebase-api-key`) and reference it via `--update-secrets FIREBASE_API_KEY=firebase-api-key:latest` in all deploy configs. The `/auth/config` endpoint reads it from the environment at runtime — that is the only place it should appear in plaintext.
 
 ### Local Development
 - **`FIREBASE_CREDENTIALS_PATH` for local dev.** In production, `FIREBASE_CREDENTIALS_JSON` (the full JSON string) is injected from Secret Manager. For local dev, pull the service account JSON to a local file (gitignored) and set `FIREBASE_CREDENTIALS_PATH` to its path in `backend/.env`.
