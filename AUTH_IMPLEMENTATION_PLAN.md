@@ -485,7 +485,10 @@ GET  /admin/usage/summary      → aggregated: {app, requests, total_tokens, est
    - FastAPI apps: protect every Gemini-calling route with `Depends(require_user(APP_ID))`.
    - Flask apps: protect every Gemini-calling route with `@login_required(APP_ID)`.
    - Add a public `/auth/config` endpoint returning Firebase web config (same as pilot).
-5. **Frontend:** add the Firebase client SDK + email/password login (copy the pilot's `api.js` token handling and login UI). Remove any existing PIN/access UI.
+5. **Frontend:** add the Firebase client SDK + email/password login (copy the pilot's `api.js` token handling and login UI). Remove any existing PIN/access UI. Include:
+   - A visible "Sign Out" button (with text label) in the top bar when logged in.
+   - A "Forgot your password? Contact the admin" `mailto:` link on the login screen.
+   - A password visibility toggle (eye icon) on the password field.
 6. **Gemini usage:** apply the Phase 5 wrap at each Gemini call site listed in the Phase 5 table.
 7. **Tests:** update each app's test suite to mock `verify_firebase_token` and pass a fake `Authorization` header; remove any PIN-related tests. Run the suite; all must pass.
 8. **Deploy:** push to `main` (Cloud Build) or run `deploy.bat`. Verify on the live service.
