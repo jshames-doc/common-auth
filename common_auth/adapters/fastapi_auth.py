@@ -15,9 +15,9 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
-from fastapi import Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from common_auth import firebase_init
 from common_auth.errors import AuthError, UsageLimitExceededError
@@ -88,3 +88,33 @@ def require_user(app_id: str) -> Callable[..., UserContext]:
         return UserContext(uid=uid, email=email, app_id=app_id)
 
     return _dependency
+
+
+def build_auth_check_router(app_id: str) -> APIRouter:
+    """Return an APIRouter exposing a lightweight GET /auth/check endpoint.
+
+    The route runs the same checks as ``require_user(app_id)`` (token verify,
+    active user, app permission) but does NOT call any downstream service
+    (e.g. Gemini). This lets a frontend verify access immediately after
+    Firebase login, independent of AI availability.
+
+    Returns:
+        An APIRouter with a single ``GET /auth/check`` route. On success it
+        responds ``200 {"ok": true, "uid", "email", "app_id"}``. On failure
+        the dependency raises ``401`` (missing/invalid token) or ``403``
+        (``USER_DISABLED`` / ``ACCESS_DENIED``) — identical to ``require_user``.
+    """
+    router = APIRouter()
+
+    @router.get("/auth/check", response_model=None)
+    async def auth_check(
+        user: UserContext = Depends(require_user(app_id)),
+    ) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "uid": user.uid,
+            "email": user.email,
+            "app_id": user.app_id,
+        }
+
+    return router

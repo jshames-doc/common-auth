@@ -11,7 +11,7 @@ import pytest
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
-from common_auth.adapters.fastapi_auth import UserContext, require_user
+from common_auth.adapters.fastapi_auth import UserContext, build_auth_check_router, require_user
 
 
 def _build_test_app(app_id: str) -> FastAPI:
@@ -111,3 +111,55 @@ class TestFastAPIAdapter:
         resp = client.get("/public")
         assert resp.status_code == 200
         assert resp.json() == {"status": "ok"}
+
+
+def _build_check_app(app_id: str) -> FastAPI:
+    """Create a FastAPI app that mounts the /auth/check router."""
+    app = FastAPI()
+    app.include_router(build_auth_check_router(app_id))
+    return app
+
+
+class TestAuthCheckRouter:
+    def test_valid_token_returns_ok(self, mock_auth):
+        app = _build_check_app("clinical_dictation")
+        client = TestClient(app)
+        resp = client.get(
+            "/auth/check",
+            headers={"Authorization": "Bearer valid-token"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["uid"] == "u1"
+        assert body["email"] == "test@example.com"
+        assert body["app_id"] == "clinical_dictation"
+
+    def test_missing_auth_header_returns_401(self, mock_auth):
+        app = _build_check_app("clinical_dictation")
+        client = TestClient(app)
+        resp = client.get("/auth/check")
+        assert resp.status_code == 401
+        assert resp.json()["detail"]["error"] == "AUTH_REQUIRED"
+
+    def test_inactive_user_returns_403(self, mock_auth):
+        mock_auth["active"].return_value = False
+        app = _build_check_app("clinical_dictation")
+        client = TestClient(app)
+        resp = client.get(
+            "/auth/check",
+            headers={"Authorization": "Bearer valid-token"},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["detail"]["error"] == "USER_DISABLED"
+
+    def test_no_app_permission_returns_403(self, mock_auth):
+        mock_auth["access"].return_value = False
+        app = _build_check_app("clinical_dictation")
+        client = TestClient(app)
+        resp = client.get(
+            "/auth/check",
+            headers={"Authorization": "Bearer valid-token"},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["detail"]["error"] == "ACCESS_DENIED"
